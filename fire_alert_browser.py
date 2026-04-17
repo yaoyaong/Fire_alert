@@ -6,6 +6,11 @@ Run:
   python fire_alert_browser.py
   python fire_alert_browser.py --host 127.0.0.1 --port 8766
 
+Delete old alerts (DB rows + linked images under logs_browser/; keeps user accounts):
+  python fire_alert_browser.py --purge-days 30
+  python fire_alert_browser.py --purge-days 0
+  (0 = remove all fire_reports and camera_detections older than "now", i.e. effectively all alert data)
+
 Uses SQLite next to this script: fire_alert_portal.db
 
 Camera RTSP page: uses **best-kiase.pt** and **best_fire.pt** (place next to this script).
@@ -27,7 +32,7 @@ import time
 import urllib.parse
 import webbrowser
 import cgi
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -396,6 +401,85 @@ def _init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def purge_old_portal_data(conn: sqlite3.Connection, days: int) -> tuple[int, int, int]:
+    """Remove fire_reports and camera_detections with created_at before (now - days). Deletes linked files under logs_browser only. Returns (reports_deleted, detections_deleted, files_removed)."""
+    if days < 0:
+        raise ValueError("days must be >= 0")
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    c = conn.cursor()
+    c.execute("SELECT image_path FROM fire_reports WHERE created_at < ?", (cutoff,))
+    paths_fr = [r[0] for r in c.fetchall()]
+    n_fr = len(paths_fr)
+    c.execute("SELECT image_path FROM camera_detections WHERE created_at < ?", (cutoff,))
+    paths_cd = [r[0] for r in c.fetchall()]
+    n_cd = len(paths_cd)
+    log_abs = os.path.abspath(_LOG_DIR) + os.sep
+    rep_abs = os.path.abspath(_REPORT_IMAGE_DIR) + os.sep
+    files_removed = 0
+
+    def try_remove(path: str | None) -> None:
+        nonlocal files_removed
+        if not path:
+            return
+        p = os.path.abspath(path)
+        if not (p.startswith(log_abs) or p.startswith(rep_abs)):
+            return
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+                files_removed += 1
+        except OSError:
+            pass
+
+    for p in paths_fr:
+        try_remove(p)
+    for p in paths_cd:
+        try_remove(p)
+    c.execute("DELETE FROM fire_reports WHERE created_at < ?", (cutoff,))
+    c.execute("DELETE FROM camera_detections WHERE created_at < ?", (cutoff,))
+    conn.commit()
+    return (n_fr, n_cd, files_removed)
+
+
+def clear_all_alert_records(conn: sqlite3.Connection) -> tuple[int, int, int]:
+    """Delete every row in fire_reports and camera_detections; remove linked images under logs_browser. Returns (reports_deleted, detections_deleted, files_removed)."""
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM fire_reports")
+    n_fr = int(c.fetchone()[0])
+    c.execute("SELECT COUNT(*) FROM camera_detections")
+    n_cd = int(c.fetchone()[0])
+    c.execute("SELECT image_path FROM fire_reports")
+    paths_fr = [r[0] for r in c.fetchall()]
+    c.execute("SELECT image_path FROM camera_detections")
+    paths_cd = [r[0] for r in c.fetchall()]
+    log_abs = os.path.abspath(_LOG_DIR) + os.sep
+    rep_abs = os.path.abspath(_REPORT_IMAGE_DIR) + os.sep
+    files_removed = 0
+
+    def try_remove(path: str | None) -> None:
+        nonlocal files_removed
+        if not path:
+            return
+        p = os.path.abspath(path)
+        if not (p.startswith(log_abs) or p.startswith(rep_abs)):
+            return
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+                files_removed += 1
+        except OSError:
+            pass
+
+    for p in paths_fr:
+        try_remove(p)
+    for p in paths_cd:
+        try_remove(p)
+    c.execute("DELETE FROM fire_reports")
+    c.execute("DELETE FROM camera_detections")
+    conn.commit()
+    return (n_fr, n_cd, files_removed)
+
+
 def auth_page_html(active: str, error: str = "", notice: str = "") -> str:
     """Login / Register — dark card UI matching Fire Alert System."""
     active = "register" if active == "register" else "login"
@@ -589,6 +673,9 @@ th, td { text-align:left; padding:9px 10px; border-bottom:1px solid #343a44; }
 th { color:#d6dae1; font-weight:700; background:#1d2026; }
 .muted { color:#9ca3af; }
 .notice { margin-bottom:10px; color:#86efac; }
+.alert-thumb { cursor: zoom-in; vertical-align: middle; }
+#imgLightbox { display: none; position: fixed; inset: 0; z-index: 10000; background: rgba(0,0,0,.88); align-items: center; justify-content: center; padding: 16px; cursor: zoom-out; }
+#imgLightbox img { max-width: 95vw; max-height: 95vh; object-fit: contain; border-radius: 8px; pointer-events: none; box-shadow: 0 8px 40px rgba(0,0,0,.45); }
 </style>
 </head><body>
 <div class="app">
@@ -608,6 +695,26 @@ th { color:#d6dae1; font-weight:700; background:#1d2026; }
     <section class="content">%s</section>
   </main>
 </div>
+<div id="imgLightbox" role="dialog" aria-label="Full image">
+  <img id="imgLightboxImg" alt="">
+</div>
+<script>
+(function(){
+  var box=document.getElementById('imgLightbox');
+  var big=document.getElementById('imgLightboxImg');
+  if(!box||!big)return;
+  function close(){ box.style.display='none'; big.removeAttribute('src'); }
+  document.addEventListener('dblclick',function(e){
+    var el=e.target;
+    if(!el||el.tagName!=='IMG'||!el.classList.contains('alert-thumb'))return;
+    e.preventDefault();
+    big.src=el.currentSrc||el.src;
+    box.style.display='flex';
+  });
+  box.addEventListener('click',close);
+  document.addEventListener('keydown',function(e){ if(e.key==='Escape'&&box.style.display==='flex')close(); });
+})();
+</script>
 </body></html>""" % (
         u,
         "".join(nav_html),
@@ -617,18 +724,129 @@ th { color:#d6dae1; font-weight:700; background:#1d2026; }
     )
 
 
-def dashboard_page_html(username: str, recent_rows: list[tuple]) -> str:
+def _is_report_record(record_type: object) -> bool:
+    return str(record_type or "").strip().lower() == "report"
+
+
+def _alert_thumb_img(url: str) -> str:
+    """Small table thumbnail; double-click opens full size via #imgLightbox in dashboard layout."""
+    return (
+        '<img class="alert-thumb" src="%s" title="Double-click to enlarge" '
+        'style="width:88px;height:50px;object-fit:cover;border:1px solid #343a44;border-radius:6px;background:#0f1115;">'
+        % html.escape(url, quote=True)
+    )
+
+
+def _alerts_context_menu_html(report_mode: str, report_day: str, report_month: str) -> str:
+    """Right-click delete for Report Fire (report-row) and camera detection (detection-row) rows."""
+    mode = html.escape(report_mode if report_mode in ("all", "day", "month") else "all")
+    day = html.escape(report_day or "")
+    month = html.escape(report_month or "")
+    return """
+<style>.report-row,.detection-row{{cursor:context-menu}}tr.report-row.ctx-selected,tr.detection-row.ctx-selected{{background:rgba(248,113,113,.14)!important;outline:1px solid rgba(248,113,113,.35);}}</style>
+<div id="ctxParams" data-mode="{mode}" data-day="{day}" data-month="{month}" style="display:none"></div>
+<div id="ctxMenu" style="display:none;position:fixed;z-index:9999;background:#23262d;border:1px solid #353a44;border-radius:8px;padding:6px 0;min-width:188px;box-shadow:0 8px 24px rgba(0,0,0,.45);">
+<button type="button" id="ctxDelete" style="width:100%;text-align:left;padding:8px 12px;background:transparent;border:none;color:#f87171;cursor:pointer;font:inherit;">Delete</button>
+</div>
+<script>
+(function(){{
+var menu=document.getElementById('ctxMenu');
+var btn=document.getElementById('ctxDelete');
+var params=document.getElementById('ctxParams');
+if(!menu||!btn||!params)return;
+var kind=null;
+var rowId=null;
+var selected=null;
+function hideMenu(){{
+menu.style.display='none';
+if(selected){{selected.classList.remove('ctx-selected');selected=null;}}
+kind=null;rowId=null;
+}}
+document.addEventListener('contextmenu',function(e){{
+var t=e.target;
+var tr=t&&t.closest?t.closest('tr.report-row, tr.detection-row'):null;
+if(!tr)return;
+e.preventDefault();
+e.stopPropagation();
+if(tr.classList.contains('report-row')){{
+kind='report';rowId=tr.getAttribute('data-report-id');
+btn.textContent='Delete report';
+}}else if(tr.classList.contains('detection-row')){{
+kind='detection';rowId=tr.getAttribute('data-detection-id');
+btn.textContent='Delete camera detection';
+}}else{{return;}}
+if(!rowId)return;
+if(selected)selected.classList.remove('ctx-selected');
+selected=tr;
+tr.classList.add('ctx-selected');
+menu.style.display='block';
+var x=e.clientX,y=e.clientY;
+menu.style.left=x+'px';
+menu.style.top=y+'px';
+var mw=menu.offsetWidth,mh=menu.offsetHeight;
+if(x+mw>window.innerWidth-4)menu.style.left=Math.max(4,x-mw)+'px';
+if(y+mh>window.innerHeight-4)menu.style.top=Math.max(4,y-mh)+'px';
+}},true);
+document.addEventListener('click',function(e){{
+if(menu.style.display!=='none'&&!menu.contains(e.target))hideMenu();
+}});
+document.addEventListener('keydown',function(e){{if(e.key==='Escape')hideMenu();}});
+btn.addEventListener('click',function(){{
+if(!rowId||!kind)return;
+var msg=kind==='report'?'Delete this report?':'Delete this camera detection record?';
+if(!confirm(msg)){{hideMenu();return;}}
+var f=document.createElement('form');
+f.method='POST';
+if(kind==='report'){{
+f.action='/home/report-delete';
+[['report_id',rowId],['report_mode',params.dataset.mode],['report_day',params.dataset.day||''],['report_month',params.dataset.month||'']].forEach(function(x){{
+var i=document.createElement('input');i.type='hidden';i.name=x[0];i.value=x[1];f.appendChild(i);
+}});
+}}else{{
+f.action='/home/detection-delete';
+[['detection_id',rowId],['report_mode',params.dataset.mode],['report_day',params.dataset.day||''],['report_month',params.dataset.month||'']].forEach(function(x){{
+var i=document.createElement('input');i.type='hidden';i.name=x[0];i.value=x[1];f.appendChild(i);
+}});
+}}
+document.body.appendChild(f);
+f.submit();
+}});
+}})();
+</script>
+""".format(
+        mode=mode,
+        day=day,
+        month=month,
+    )
+
+
+def dashboard_page_html(username: str, recent_rows: list[tuple], notice: str = "") -> str:
+    notice_html = '<div class="notice">%s</div>' % html.escape(notice) if notice else ""
+    clear_form = """
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:10px;">
+  <h3 style="margin:0;">Recent Alerts</h3>
+  <form method="post" action="/home/clear-all-alerts" style="margin:0;" onsubmit="return confirm('Clear all fire reports and camera detection records? This cannot be undone.');">
+    <button class="submit" type="submit" style="padding:8px 14px;font-size:.85rem;background:#374151;">Clear all records</button>
+  </form>
+</div>"""
     if recent_rows:
         items = []
-        for ts, source, severity, details, image_path in recent_rows:
+        for ts, source, severity, details, image_path, record_type, record_id in recent_rows:
             img_html = '<span class="muted">-</span>'
             if image_path:
-                img_html = '<img src="/home/detection-image?path=%s" style="width:88px;height:50px;object-fit:cover;border:1px solid #343a44;border-radius:6px;background:#0f1115;">' % urllib.parse.quote(
-                    image_path, safe=""
-                )
+                q = urllib.parse.quote(image_path, safe="")
+                if _is_report_record(record_type):
+                    img_html = _alert_thumb_img("/home/report-image?path=%s" % q)
+                else:
+                    img_html = _alert_thumb_img("/home/detection-image?path=%s" % q)
+            if _is_report_record(record_type):
+                tr_open = '<tr class="alert-row report-row" data-report-id="%s">' % html.escape(str(record_id))
+            else:
+                tr_open = '<tr class="alert-row detection-row" data-detection-id="%s">' % html.escape(str(record_id))
             items.append(
-                "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                "%s<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
                 % (
+                    tr_open,
                     html.escape(str(ts)),
                     html.escape(source),
                     html.escape(severity),
@@ -636,20 +854,29 @@ def dashboard_page_html(username: str, recent_rows: list[tuple]) -> str:
                     img_html,
                 )
             )
-        content = """
+        content = (
+            """
 <div class="panel">
-  <h3>Recent Alerts</h3>
+  %s
+  %s
+  <p class="muted" style="font-size:0.82rem;margin:0 0 10px 0;line-height:1.35;">Right-click a row to delete: <strong>Report Fire</strong> or <strong>camera detection</strong> (same as the Action column on All Alerts).</p>
   <table>
     <thead><tr><th>Time</th><th>Source</th><th>Severity</th><th>Details</th><th>Image</th></tr></thead>
     <tbody>%s</tbody>
   </table>
-</div>""" % "".join(items)
+</div>%s"""
+            % (clear_form, notice_html, "".join(items), _alerts_context_menu_html("all", "", ""))
+        )
     else:
         content = """
 <div class="panel">
-  <h3>Recent Alerts</h3>
+  %s
+  %s
   <div class="empty">No alerts found</div>
-</div>"""
+</div>""" % (
+            clear_form,
+            notice_html,
+        )
     return _dashboard_layout_html(username, "dashboard", "Fire Alert Dashboard", content, show_filters=True)
 
 
@@ -713,11 +940,13 @@ def all_alerts_page_html(
         for ts, source, severity, details, status, image_path, record_type, record_id in rows:
             img_html = '<span class="muted">-</span>'
             if image_path:
-                img_html = '<img src="/home/report-image?path=%s" style="width:88px;height:50px;object-fit:cover;border:1px solid #343a44;border-radius:6px;background:#0f1115;">' % urllib.parse.quote(
-                    image_path, safe=""
-                )
+                q = urllib.parse.quote(image_path, safe="")
+                if _is_report_record(record_type):
+                    img_html = _alert_thumb_img("/home/report-image?path=%s" % q)
+                else:
+                    img_html = _alert_thumb_img("/home/detection-image?path=%s" % q)
             action_html = '<span class="muted">-</span>'
-            if record_type == "report":
+            if _is_report_record(record_type):
                 action_html = (
                     '<form method="post" action="/home/report-delete" style="margin:0;">'
                     '<input type="hidden" name="report_id" value="%s">'
@@ -733,9 +962,32 @@ def all_alerts_page_html(
                         month_val,
                     )
                 )
+                tr_open = '<tr class="alert-row report-row" data-report-id="%s">' % html.escape(
+                    str(record_id)
+                )
+            else:
+                action_html = (
+                    '<form method="post" action="/home/detection-delete" style="margin:0;">'
+                    '<input type="hidden" name="detection_id" value="%s">'
+                    '<input type="hidden" name="report_mode" value="%s">'
+                    '<input type="hidden" name="report_day" value="%s">'
+                    '<input type="hidden" name="report_month" value="%s">'
+                    '<button class="submit" type="submit" style="padding:6px 10px;font-size:.82rem;">Delete</button>'
+                    "</form>"
+                    % (
+                        html.escape(str(record_id)),
+                        html.escape(mode),
+                        day_val,
+                        month_val,
+                    )
+                )
+                tr_open = '<tr class="alert-row detection-row" data-detection-id="%s">' % html.escape(
+                    str(record_id)
+                )
             body.append(
-                "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                "%s<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
                 % (
+                    tr_open,
                     html.escape(str(ts)),
                     html.escape(source),
                     html.escape(severity),
@@ -745,14 +997,16 @@ def all_alerts_page_html(
                     action_html,
                 )
             )
+        ctx_block = _alerts_context_menu_html(mode, report_day or "", report_month or "")
         table = """
 <div class="panel">
   <h3>All Alerts</h3>
+  <p class="muted" style="font-size:0.82rem;margin:0 0 10px 0;line-height:1.35;">Right-click a row to delete <strong>Report Fire</strong> or <strong>camera detection</strong>, or use the Delete button in the Action column.</p>
   <table>
     <thead><tr><th>Time</th><th>Source</th><th>Severity</th><th>Details</th><th>Status</th><th>Image</th><th>Action</th></tr></thead>
     <tbody>%s</tbody>
   </table>
-</div>""" % "".join(body)
+</div>%s""" % ("".join(body), ctx_block)
     else:
         table = '<div class="panel"><h3>All Alerts</h3><div class="empty">No alerts found</div></div>'
     return _dashboard_layout_html(username, "all-alerts", "All Alerts", notice_html + filter_html + table)
@@ -865,9 +1119,18 @@ def camera_detection_page_html(
 def main() -> None:
     host = "127.0.0.1"
     port = 8766
+    purge_days: int | None = None
     argv = sys.argv[1:]
     i = 0
     while i < len(argv):
+        if argv[i] == "--purge-days" and i + 1 < len(argv):
+            try:
+                purge_days = int(argv[i + 1])
+            except ValueError:
+                print("Invalid --purge-days value", file=sys.stderr)
+                sys.exit(2)
+            i += 2
+            continue
         if argv[i] == "--port" and i + 1 < len(argv):
             port = int(argv[i + 1])
             i += 2
@@ -881,6 +1144,23 @@ def main() -> None:
             sys.exit(0)
         print("Unknown argument:", argv[i], file=sys.stderr)
         sys.exit(2)
+
+    if purge_days is not None:
+        if purge_days < 0:
+            print("--purge-days must be >= 0", file=sys.stderr)
+            sys.exit(2)
+        conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        _init_db(conn)
+        try:
+            n_fr, n_cd, n_files = purge_old_portal_data(conn, purge_days)
+            print(
+                "Purged rows older than %d day(s): fire_reports=%d, camera_detections=%d; image files removed=%d"
+                % (purge_days, n_fr, n_cd, n_files)
+            )
+            print("Database: %s" % _DB_PATH)
+        finally:
+            conn.close()
+        return
 
     conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
     _init_db(conn)
@@ -992,14 +1272,16 @@ def main() -> None:
                 if not u:
                     self._redirect("/")
                     return
+                cleared = (qs.get("cleared") or [""])[0] == "1"
+                notice = "All alert records have been cleared." if cleared else ""
                 state["cursor"].execute(
                     """
-                    SELECT created_at, source, severity, details, image_path
+                    SELECT created_at, source, severity, details, image_path, record_type, record_id
                     FROM (
-                        SELECT created_at, 'Report Fire' AS source, severity, description AS details, NULL AS image_path, id
+                        SELECT created_at, 'Report Fire' AS source, severity, description AS details, image_path, 'report' AS record_type, id AS record_id
                         FROM fire_reports
                         UNION ALL
-                        SELECT created_at, camera_name AS source, severity, details, image_path, id
+                        SELECT created_at, camera_name AS source, severity, details, image_path, 'detection' AS record_type, id AS record_id
                         FROM camera_detections
                     )
                     ORDER BY created_at DESC
@@ -1007,7 +1289,7 @@ def main() -> None:
                     """
                 )
                 rows = state["cursor"].fetchall()
-                self._send_html(dashboard_page_html(u, rows))
+                self._send_html(dashboard_page_html(u, rows, notice=notice))
                 return
 
             if parsed.path == "/home/detection-image":
@@ -1283,10 +1565,27 @@ def main() -> None:
                 self._send_html(report_fire_page_html(u, notice="Report submitted successfully."))
                 return
 
+            if parsed.path == "/home/clear-all-alerts":
+                u = session_user(self)
+                if not u:
+                    self._redirect("/")
+                    return
+                fields_clear = self._read_form()
+                if fields_clear is None:
+                    self.send_error(413)
+                    return
+                clear_all_alert_records(state["conn"])
+                self._redirect("/home?cleared=1")
+                return
+
             if parsed.path == "/home/report-delete":
                 u = session_user(self)
                 if not u:
                     self._redirect("/")
+                    return
+                fields = self._read_form()
+                if fields is None:
+                    self.send_error(413)
                     return
                 report_id_raw = self._one(fields, "report_id").strip()
                 report_mode = self._one(fields, "report_mode").strip() or "all"
@@ -1307,6 +1606,48 @@ def main() -> None:
                         if image_path:
                             abs_path = os.path.abspath(image_path)
                             if abs_path.startswith(os.path.abspath(_REPORT_IMAGE_DIR) + os.sep) and os.path.isfile(abs_path):
+                                os.remove(abs_path)
+                    except Exception:
+                        pass
+                q = urllib.parse.urlencode(
+                    {
+                        "report_mode": report_mode,
+                        "report_day": report_day,
+                        "report_month": report_month,
+                    }
+                )
+                self._redirect("/home/all-alerts?" + q)
+                return
+
+            if parsed.path == "/home/detection-delete":
+                u = session_user(self)
+                if not u:
+                    self._redirect("/")
+                    return
+                fields = self._read_form()
+                if fields is None:
+                    self.send_error(413)
+                    return
+                det_raw = self._one(fields, "detection_id").strip()
+                report_mode = self._one(fields, "report_mode").strip() or "all"
+                report_day = self._one(fields, "report_day").strip()
+                report_month = self._one(fields, "report_month").strip()
+                try:
+                    det_id = int(det_raw)
+                except Exception:
+                    self._redirect("/home/all-alerts")
+                    return
+                state["cursor"].execute("SELECT image_path FROM camera_detections WHERE id = ?", (det_id,))
+                row = state["cursor"].fetchone()
+                if row:
+                    image_path = row[0]
+                    state["cursor"].execute("DELETE FROM camera_detections WHERE id = ?", (det_id,))
+                    state["conn"].commit()
+                    try:
+                        if image_path:
+                            abs_path = os.path.abspath(image_path)
+                            log_root = os.path.abspath(_LOG_DIR) + os.sep
+                            if abs_path.startswith(log_root) and os.path.isfile(abs_path):
                                 os.remove(abs_path)
                     except Exception:
                         pass
