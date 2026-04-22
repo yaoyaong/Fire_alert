@@ -62,7 +62,7 @@ MODEL_FILES = (
     ("best-kiase.pt", "kiase"),
     ("best_fire.pt", "fire"),
 )
-CONF_THRESHOLD = float(os.environ.get("FIRE_ALERT_CONF", "0.85"))
+CONF_THRESHOLD = float(os.environ.get("FIRE_ALERT_CONF", "0.7"))
 DETECT_EVERY_N = int(os.environ.get("FIRE_ALERT_DETECT_EVERY", "3"))
 YOLO_IMGSZ = int(os.environ.get("FIRE_ALERT_IMGSZ", "640"))
 LOG_FIRE_COOLDOWN_SEC = float(os.environ.get("FIRE_ALERT_LOG_COOLDOWN", "20"))
