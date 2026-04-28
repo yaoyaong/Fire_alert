@@ -15,17 +15,26 @@ Uses SQLite next to this script: fire_alert_portal.db
 
 Camera RTSP page: uses **best-kiase.pt** and **best_fire.pt** (place next to this script).
 Install: pip install ultralytics opencv-python
-Optional env: FIRE_ALERT_CONF, FIRE_ALERT_DETECT_EVERY, FIRE_ALERT_IMGSZ, FIRE_ALERT_LOG_COOLDOWN
+WhatsApp auto-send (press Send + paste snapshot from logs_browser/): pip install pyautogui
+  Windows image paste into WhatsAppDesktop: also pip install Pillow pywin32
+Optional env: FIRE_ALERT_CONF, FIRE_ALERT_DETECT_EVERY, FIRE_ALERT_IMGSZ,
+  FIRE_ALERT_LOG_COOLDOWN — seconds between DB rows/snapshots (default 20)
+  FIRE_ALERT_DEBOUNCE_CHECKS — consecutive no-fire inference passes before a new snapshot episode (default 4; set 0 to disable)
+  FIRE_ALERT_WA_COOLDOWN — WhatsApp send cooldown (seconds between alerts; default 60)
+  FIRE_ALERT_WA_LAUNCH_PAUSE — seconds after opening WhatsApp chat before auto Send (default 8)
+  FIRE_ALERT_WA_CTRL_ENTER_SEND=1 — use Ctrl+Enter instead of Enter if WhatsApp is set that way
 """
 
 from __future__ import annotations
 
 import hashlib
 import html
+import json
 import os
 import re
 import secrets
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -66,10 +75,70 @@ CONF_THRESHOLD = float(os.environ.get("FIRE_ALERT_CONF", "0.7"))
 DETECT_EVERY_N = int(os.environ.get("FIRE_ALERT_DETECT_EVERY", "3"))
 YOLO_IMGSZ = int(os.environ.get("FIRE_ALERT_IMGSZ", "640"))
 LOG_FIRE_COOLDOWN_SEC = float(os.environ.get("FIRE_ALERT_LOG_COOLDOWN", "20"))
+# Consecutive inference passes without fire before allowing another logged snapshot (threshold-flicker guard). 0 = off (still only snapshots when cooldown accepts log).
+FIRE_ALERT_DEBOUNCE_CHECKS = max(0, int(os.environ.get("FIRE_ALERT_DEBOUNCE_CHECKS", "4")))
+# Minimum seconds between WhatsApp sends (global; separate from DB log cooldown)
+WHATSAPP_MESSAGE_COOLDOWN_SEC = float(os.environ.get("FIRE_ALERT_WA_COOLDOWN", "60"))
+# Seconds to wait after opening whatsapp:// before sending keys (focus + WhatsApp Desktop startup)
+_WHATSAPP_LAUNCH_PAUSE_SEC = float(os.environ.get("FIRE_ALERT_WA_LAUNCH_PAUSE", "12"))
 
 _SESSION_COOKIE = "fire_alert_portal_session"
 _SESSION_TTL_SEC = 86400 * 7
 _MJPEG_BOUNDARY = b"frame"
+
+
+def _is_local_camera_source(s: str) -> bool:
+    """True when the field is an OpenCV webcam index or common aliases (same idea as desktop app)."""
+    if not s or not isinstance(s, str):
+        return False
+    t = s.strip().lower()
+    if t in ("localhost", "webcam", "local"):
+        return True
+    if t.isdigit():
+        return int(t) >= 0
+    return False
+
+
+def _local_camera_index(s: str) -> int:
+    """Resolve webcam index from user input (0 & 1 for typical multi-camera setups)."""
+    t = s.strip().lower()
+    if t in ("localhost", "webcam", "local"):
+        return 0
+    if t.isdigit():
+        return int(t)
+    return 0
+
+
+def _camera_display_name(source: str) -> str:
+    """Readable label for DB rows / UI when source is RTSP vs local."""
+    if not source:
+        return source
+    if _is_local_camera_source(source):
+        return "Local camera %d" % _local_camera_index(source)
+    return source[:180] if len(source) > 180 else source
+
+
+def _open_video_capture(source: str):
+    """OpenCV capture: local index (0, 1, …) or RTSP URL with FFMPEG backend."""
+    if cv2 is None or not source:
+        return None
+    try:
+        if _is_local_camera_source(source):
+            cap = cv2.VideoCapture(_local_camera_index(source))
+        else:
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        if cap is not None:
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+        if cap is not None and cap.isOpened():
+            return cap
+        if cap is not None:
+            cap.release()
+    except Exception:
+        pass
+    return None
 
 
 def _model_path(filename: str) -> str:
@@ -155,6 +224,8 @@ class RtspBridge:
         self._latest_frame = None
         self._cached_boxes: list = []
         self._last_log_time = 0.0
+        self._debounce_cleared_streak = 0
+        self._episode_open_for_next_log = True
 
     def ensure_stream(self, rtsp_url: str, selected_models: list[str] | None = None, conf_threshold: float | None = None) -> None:
         picked = selected_models or list(self._models_map.keys())
@@ -182,6 +253,8 @@ class RtspBridge:
             self._last_detected_frame_count = 0
             self._latest_frame = None
             self._cached_boxes = []
+            self._debounce_cleared_streak = 0
+            self._episode_open_for_next_log = True
             self._stop.clear()
             self._capture_thread = threading.Thread(target=self._run_capture, daemon=True)
             self._detect_thread = threading.Thread(target=self._run_detect, daemon=True)
@@ -200,15 +273,18 @@ class RtspBridge:
         except Exception:
             return None
 
-    def _maybe_log_fire(self, rtsp_url: str, max_conf: float, snap_path: str | None = None) -> None:
+    def _maybe_log_fire(self, rtsp_url: str, max_conf: float, annotated_frame=None) -> bool:
+        """Persist one row + JPG only when FIRE_ALERT_LOG_COOLDOWN allows (no imwrite spam while fire persists)."""
         if not self._state or max_conf <= 0:
-            return
+            return False
         now = time.time()
         if now - self._last_log_time < LOG_FIRE_COOLDOWN_SEC:
-            return
-        self._last_log_time = now
+            return False
+        snap_path = None
         try:
-            cam = rtsp_url[:180] if len(rtsp_url) > 180 else rtsp_url
+            if annotated_frame is not None:
+                snap_path = self._save_snapshot(annotated_frame)
+            cam = _camera_display_name(rtsp_url)
             model_text = ",".join(self._active_model_names) if self._active_model_names else "none"
             details = "YOLO %s | threshold %.2f | max conf %.0f%%" % (model_text, self._conf_threshold, max_conf * 100.0)
             self._state["cursor"].execute(
@@ -223,6 +299,46 @@ class RtspBridge:
                 ),
             )
             self._state["conn"].commit()
+            self._last_log_time = now
+            self._post_log_whatsapp(cam, details, max_conf, snap_path)
+            return True
+        except Exception:
+            return False
+
+    def _post_log_whatsapp(self, cam_label: str, details: str, max_conf: float, snap_path: str | None) -> None:
+        """Optional: send WhatsApp links on detection (same machine as server)."""
+        wt = None
+        if self._state:
+            wt = self._state.get("wa_times")
+        if not wt or self._state is None:
+            return
+        try:
+            cur = self._state["cursor"]
+            if not load_whatsapp_auto_send(cur):
+                return
+            phones = load_whatsapp_phones_list(cur)
+            if not phones:
+                return
+            wa_lock = self._state.get("wa_lock")
+            if wa_lock is None:
+                wa_lock = threading.Lock()
+                self._state["wa_lock"] = wa_lock
+            now_ts = time.time()
+            with wa_lock:
+                if now_ts - float(wt.get("last_msg", 0.0)) < WHATSAPP_MESSAGE_COOLDOWN_SEC:
+                    return
+                wt["last_msg"] = now_ts
+            phones_snapshot = list(phones)
+            time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            msg = (
+                "【火警偵測 / Fire alert】\n鏡頭: %s\n最高置信度: %.0f%%\n詳情: %s\n時間: %s\n（請開啟系統查看截圖）"
+                % (cam_label, max_conf * 100, details[:400], time_str)
+            )
+            threading.Thread(
+                target=_portal_whatsapp_send_worker,
+                args=(phones_snapshot, msg, snap_path),
+                daemon=True,
+            ).start()
         except Exception:
             pass
 
@@ -230,12 +346,10 @@ class RtspBridge:
         url = self._url
         if not url or cv2 is None:
             return
-        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        cap = _open_video_capture(url)
+        if cap is None:
+            return
         self._cap = cap
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
         while not self._stop.is_set():
             ok, frame = cap.read()
             if not ok:
@@ -285,11 +399,24 @@ class RtspBridge:
             boxes, fire, max_cf = _run_dual_fire_detect(models, frame, conf, YOLO_IMGSZ)
             with self._lock:
                 self._cached_boxes = boxes
-            if fire:
+
+            eligible = False
+            if FIRE_ALERT_DEBOUNCE_CHECKS <= 0:
+                eligible = bool(fire)
+            else:
+                if fire:
+                    self._debounce_cleared_streak = 0
+                    eligible = self._episode_open_for_next_log
+                else:
+                    self._debounce_cleared_streak += 1
+                    if self._debounce_cleared_streak >= FIRE_ALERT_DEBOUNCE_CHECKS:
+                        self._episode_open_for_next_log = True
+
+            if eligible and fire:
                 snap = frame.copy()
                 _draw_fire_boxes(snap, boxes)
-                snap_path = self._save_snapshot(snap)
-                self._maybe_log_fire(url, max_cf, snap_path=snap_path)
+                if self._maybe_log_fire(url, max_cf, annotated_frame=snap) and FIRE_ALERT_DEBOUNCE_CHECKS > 0:
+                    self._episode_open_for_next_log = False
             time.sleep(0.005)
 
     def get_jpeg(self):
@@ -398,7 +525,357 @@ def _init_db(conn: sqlite3.Connection) -> None:
         c.execute("ALTER TABLE camera_detections ADD COLUMN image_path TEXT")
     except Exception:
         pass
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS portal_settings (
+            key TEXT PRIMARY KEY NOT NULL,
+            value TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
+
+
+def _portal_setting_get(cursor: sqlite3.Cursor, key: str, default: str | None = None) -> str | None:
+    cursor.execute("SELECT value FROM portal_settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    return row[0] if row else default
+
+
+def _portal_setting_set(conn: sqlite3.Connection, cursor: sqlite3.Cursor, key: str, value: str) -> None:
+    cursor.execute("INSERT OR REPLACE INTO portal_settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+
+
+def _normalize_whatsapp_phone_line(s: str) -> str | None:
+    t = (s or "").strip()
+    if not t.startswith("+"):
+        return None
+    digits = "".join(c for c in t if c.isdigit())
+    if len(digits) < 8:
+        return None
+    return t
+
+
+def parse_whatsapp_phones_blob(blob: str) -> list[str]:
+    out: list[str] = []
+    for line in (blob or "").replace(",", "\n").splitlines():
+        n = _normalize_whatsapp_phone_line(line.strip())
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def load_whatsapp_phones_list(cursor: sqlite3.Cursor) -> list[str]:
+    raw = _portal_setting_get(cursor, "whatsapp_phones_json", "[]") or "[]"
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            phones: list[str] = []
+            for x in data:
+                n = _normalize_whatsapp_phone_line(str(x).strip())
+                if n and n not in phones:
+                    phones.append(n)
+            return phones
+    except Exception:
+        pass
+    return []
+
+
+def load_whatsapp_auto_send(cursor: sqlite3.Cursor) -> bool:
+    return (_portal_setting_get(cursor, "whatsapp_auto_send", "0") or "0") == "1"
+
+
+def save_whatsapp_preferences(conn: sqlite3.Connection, cursor: sqlite3.Cursor, phones: list[str], auto_send: bool) -> None:
+    _portal_setting_set(conn, cursor, "whatsapp_phones_json", json.dumps(phones))
+    _portal_setting_set(conn, cursor, "whatsapp_auto_send", "1" if auto_send else "0")
+
+
+def _safe_snap_path_under_logs(path: str | None) -> str | None:
+    """Only allow attaching images under logs_browser/ (detection jpgs)."""
+    if not path or not isinstance(path, str):
+        return None
+    p = os.path.abspath(path)
+    root = os.path.abspath(_LOG_DIR) + os.sep
+    if not p.startswith(root) or not os.path.isfile(p):
+        return None
+    return p
+
+
+def put_logs_browser_image_in_clipboard(image_path: str) -> bool:
+    """Put JPG/PNG under logs_browser into Windows clipboard as BMP (paste into WhatsApp). Same strategy as desktop app."""
+    if _safe_snap_path_under_logs(image_path) is None:
+        return False
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+        import win32clipboard
+
+        img = Image.open(image_path).convert("RGB")
+        output = BytesIO()
+        img.save(output, "BMP")
+        data = output.getvalue()[14:]
+        output.close()
+        win32clipboard.OpenClipboard()
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
+        win32clipboard.CloseClipboard()
+        return True
+    except Exception:
+        return False
+
+
+def put_text_in_clipboard(text: str) -> bool:
+    """Put plain Unicode text to clipboard (Windows first, fallback to pyperclip)."""
+    if text is None:
+        return False
+    s = str(text)
+    try:
+        if sys.platform == "win32":
+            import win32clipboard
+
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(s, win32clipboard.CF_UNICODETEXT)
+            win32clipboard.CloseClipboard()
+            return True
+    except Exception:
+        pass
+    try:
+        import pyperclip
+
+        pyperclip.copy(s)
+        return True
+    except Exception:
+        return False
+
+
+_wa_logged_no_pyautogui = False
+_wa_logged_clipboard_help = False
+
+
+def _wa_prefers_ctrl_enter_send() -> bool:
+    """True when user set WhatsApp to send with Ctrl+Enter (otherwise Enter inserts newline)."""
+    v = (os.environ.get("FIRE_ALERT_WA_CTRL_ENTER_SEND") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _win_activate_whatsapp_window() -> bool:
+    """Bring WhatsApp (Desktop) chat to the foreground so pyautogui hits the composer, not Chrome/browser."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import win32con
+        import win32gui
+    except ImportError:
+        return False
+
+    strict_matches: list[int] = []
+
+    def cb_strict(hwnd, _ctx) -> bool:
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd)
+            if not title:
+                return True
+            tl = title.lower()
+            if "whatsapp" not in tl:
+                return True
+            if any(
+                x in tl
+                for x in (
+                    " - google chrome",
+                    "mozilla firefox",
+                    "microsoft edge",
+                )
+            ):
+                return True
+            strict_matches.append(hwnd)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(cb_strict, None)
+    except Exception:
+        return False
+
+    pool = strict_matches
+    if not pool:
+        broad: list[int] = []
+
+        def cb_broad(hwnd, _ctx) -> bool:
+            try:
+                if win32gui.IsWindowVisible(hwnd):
+                    tl = win32gui.GetWindowText(hwnd).lower()
+                    if "whatsapp" in tl:
+                        broad.append(hwnd)
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(cb_broad, None)
+        except Exception:
+            return False
+        pool = broad
+
+    if not pool:
+        return False
+    try:
+        hwnd = pool[0]
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
+def _portal_whatsapp_press_send(pyautogui) -> None:
+    """Try both send shortcuts; WhatsApp send key setting varies by machine."""
+    if _wa_prefers_ctrl_enter_send():
+        pyautogui.hotkey("ctrl", "enter")
+        time.sleep(0.28)
+        pyautogui.press("enter")
+    else:
+        pyautogui.press("enter")
+        time.sleep(0.28)
+        pyautogui.hotkey("ctrl", "enter")
+
+
+def _wait_whatsapp_foreground(pyautogui, timeout_sec: float = 10.0) -> bool:
+    """Wait until WhatsApp window is foreground; optionally click center to force focus."""
+    deadline = time.time() + max(1.0, timeout_sec)
+    focused_once = False
+    while time.time() < deadline:
+        focused_once = _win_activate_whatsapp_window() or focused_once
+        if focused_once:
+            time.sleep(0.18)
+            return True
+        time.sleep(0.3)
+    # Fallback: one center click can dismiss browser protocol prompt and give focus to app
+    try:
+        w, h = pyautogui.size()
+        pyautogui.click(w // 2, h // 2)
+        time.sleep(0.25)
+    except Exception:
+        pass
+    return _win_activate_whatsapp_window()
+
+
+def _open_whatsapp_chat_prefer_desktop(wa_url: str, web_fallback_url: str) -> bool:
+    """Open WhatsApp chat, preferring desktop app executables on Windows."""
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            os.path.join(local, "WhatsApp", "WhatsApp.exe"),
+            os.path.join(local, "Programs", "WhatsApp", "WhatsApp.exe"),
+        ]
+        for exe in candidates:
+            if os.path.isfile(exe):
+                try:
+                    # Step 1: launch desktop client
+                    subprocess.Popen([exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    # Step 2: invoke registered protocol handler (avoid explorer.exe side effects)
+                    time.sleep(0.7)
+                    webbrowser.open(wa_url)
+                    return True
+                except Exception:
+                    pass
+    try:
+        webbrowser.open(wa_url)
+        return True
+    except Exception:
+        pass
+    try:
+        webbrowser.open(web_fallback_url)
+        return True
+    except Exception:
+        return False
+
+
+def _open_whatsapp_chat_for_number(digits: str, q_text: str) -> bool:
+    """Open deep-link for an exact target number."""
+    wa_url = "whatsapp://send?phone=%s&text=%s" % (digits, q_text)
+    wa_web_url = "https://wa.me/%s?text=%s" % (digits, q_text)
+    return _open_whatsapp_chat_prefer_desktop(wa_url, wa_web_url)
+
+
+def _portal_whatsapp_send_worker(phones: list[str], message: str, snapshot_path: str | None = None) -> None:
+    """Desktop-style send flow (same idea as fire_alert_desktop1.send_whatsapp_single)."""
+    from urllib.parse import quote
+
+    if not phones or not message:
+        return
+
+    snap = _safe_snap_path_under_logs(snapshot_path)
+    clipboard_supported = snap is not None and sys.platform == "win32"
+
+    pyautogui = None
+    try:
+        import pyautogui as _pa
+
+        pyautogui = _pa
+        pyautogui.PAUSE = 0.12
+        pyautogui.FAILSAFE = False
+    except Exception:
+        pass
+
+    global _wa_logged_no_pyautogui
+    global _wa_logged_clipboard_help
+    if not pyautogui and not _wa_logged_no_pyautogui:
+        _wa_logged_no_pyautogui = True
+        print("[WhatsApp] pip install pyautogui — then alerts will press Send and optionally paste snapshots.", file=sys.stderr)
+        return
+
+    for i, ph in enumerate(phones):
+        digits = "".join(c for c in ph if c.isdigit())
+        if len(digits) < 8:
+            continue
+        q = quote(message[:3500])
+
+        if snap and clipboard_supported:
+            put_logs_browser_image_in_clipboard(snap)
+
+        try:
+            # Open target chat, then re-open same deep-link once to reduce wrong-chat focus.
+            if not _open_whatsapp_chat_for_number(digits, q):
+                continue
+            time.sleep(max(4.0, _WHATSAPP_LAUNCH_PAUSE_SEC))
+            _wait_whatsapp_foreground(pyautogui, timeout_sec=8.0)
+            _open_whatsapp_chat_for_number(digits, q)
+            time.sleep(1.0)
+            _wait_whatsapp_foreground(pyautogui, timeout_sec=3.0)
+            # Force message into composer to avoid cases where deep-link text is visible
+            # but not actually focused/sent.
+            if put_text_in_clipboard(message[:3500]):
+                try:
+                    pyautogui.hotkey("ctrl", "a")
+                    time.sleep(0.12)
+                    pyautogui.press("backspace")
+                    time.sleep(0.12)
+                    pyautogui.hotkey("ctrl", "v")
+                    time.sleep(0.25)
+                except Exception:
+                    pass
+            _portal_whatsapp_press_send(pyautogui)
+            if snap and clipboard_supported:
+                time.sleep(1.0)
+                if put_logs_browser_image_in_clipboard(snap):
+                    pyautogui.hotkey("ctrl", "v")
+                    time.sleep(0.8)
+                    _wait_whatsapp_foreground(pyautogui, timeout_sec=3.0)
+                    _portal_whatsapp_press_send(pyautogui)
+                elif not _wa_logged_clipboard_help:
+                    _wa_logged_clipboard_help = True
+                    print("[WhatsApp] pip install Pillow pywin32 to paste JPG snapshots on Windows.", file=sys.stderr)
+        except Exception as ex:
+            print("[WhatsApp] automation failed:", ex, file=sys.stderr)
+
+        if i < len(phones) - 1:
+            time.sleep(3.0)
 
 
 def purge_old_portal_data(conn: sqlite3.Connection, days: int) -> tuple[int, int, int]:
@@ -1021,6 +1498,10 @@ def camera_detection_page_html(
     conf_value: float = CONF_THRESHOLD,
     selected_models: list[str] | None = None,
     available_models: list[str] | None = None,
+    poll_since_id: int = 0,
+    wa_phones_lines: str = "",
+    wa_auto_send: bool = False,
+    camera_notice: str = "",
 ) -> str:
     rtsp_url = (rtsp_url or "").strip()
     selected_models = selected_models or []
@@ -1038,11 +1519,16 @@ def camera_detection_page_html(
         stream_box = (
             '<div class="panel" style="margin-bottom:12px;">'
             '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;">'
-            '<h3 style="margin:0;">Live RTSP Preview</h3>'
-            '<button class="submit" type="button" onclick="toggleStreamFullScreen()">Full Screen</button>'
+            '<h3 style="margin:0;">Live camera preview</h3>'
+            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">'
+            '<form method="post" action="/home/camera-detection/stop" style="margin:0;">'
+            '<button type="submit" class="submit" style="margin:0;background:#475569;">Stop detection</button>'
+            "</form>"
+            '<button class="submit" type="button" style="margin:0;" onclick="toggleStreamFullScreen()">Full Screen</button>'
+            "</div>"
             "</div>"
             '<div id="streamWrap" style="width:100%%;height:min(78vh,900px);background:#0b0d10;border:1px solid #343a44;border-radius:6px;overflow:hidden;">'
-            '<img id="rtspStream" src="%s" alt="RTSP stream" style="width:100%%;height:100%%;object-fit:contain;background:#0b0d10;">'
+            '<img id="rtspStream" src="%s" alt="Camera stream" style="width:100%%;height:100%%;object-fit:contain;background:#0b0d10;">'
             "</div>"
             '<script>'
             "function toggleStreamFullScreen(){"
@@ -1094,11 +1580,133 @@ def camera_detection_page_html(
             "</label>" % (html.escape(m), checked, html.escape(m))
         )
 
+    local_preset = [("conf", "%.2f" % conf_value)] + [("models", m) for m in selected_models]
+    local0_href = "/home/camera-detection?" + urllib.parse.urlencode([("url", "0")] + local_preset)
+    local1_href = "/home/camera-detection?" + urllib.parse.urlencode([("url", "1")] + local_preset)
+
+    boot = {
+        "sinceId": int(poll_since_id),
+        "waAuto": bool(wa_auto_send),
+        "pollMs": 1500,
+    }
+    boot_json = json.dumps(boot, ensure_ascii=False).replace("<", "\\u003c")
+
+    notify_block = """<style>
+#detectNotifyBar{position:sticky;top:0;z-index:100;display:none;align-items:flex-start;gap:12px;flex-wrap:wrap;
+  margin:-8px -8px 14px;padding:12px 14px;border-radius:8px;background:linear-gradient(90deg,rgba(220,38,38,.95),rgba(251,146,60,.88));
+  border:1px solid rgba(254,243,199,.35);color:#fff;box-shadow:0 10px 30px rgba(0,0,0,.35);}
+#detectNotifyBar.show{display:flex;}
+#detectNotifyBar .msg{flex:1;min-width:220px;font-size:0.95rem;line-height:1.45;margin:0;}
+#detectNotifyBar button{background:#fff;color:#991b1b;border:none;padding:8px 12px;border-radius:6px;font-weight:700;cursor:pointer;}
+#detectNotifyBar .sub{border-left:1px solid rgba(255,255,255,.35);padding-left:12px;display:flex;align-items:center;gap:8px;}
+#waBackdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:200;align-items:center;justify-content:center;padding:16px;}
+#waBackdrop.show{display:flex;}
+#waModal{background:#23262d;border:1px solid #3d4450;border-radius:12px;max-width:480px;width:100%%;padding:18px 20px;box-shadow:0 24px 50px rgba(0,0,0,.5);}
+#waModal h3{margin:0 0 6px;font-size:1.1rem;}
+#waModal .sub{margin:0 0 14px;font-size:0.85rem;color:#9ca3af;line-height:1.4;}
+#waPhones{width:100%%;min-height:100px;font-family:inherit;font-size:0.92rem;background:#15181e;color:#f3f4f6;border:1px solid #3d4450;border-radius:8px;padding:10px;}
+.wa-row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:12px 0;flex-wrap:wrap;}
+.cam-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px;}
+</style>
+<div class="cam-toolbar">
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+    <button class="submit" type="button" id="btnOpenWaModal" style="margin:0;">Manage WhatsApp recipients</button>
+    <span class="muted" style="font-size:0.85rem;line-height:1.35;">After a detection, WhatsApp send links open on the PC running this server (not in the browser).</span>
+  </div>
+</div>
+<div id="detectNotifyBar" role="alert" aria-live="polite">
+  <p class="msg" id="detectNotifyText"></p>
+  <div class="sub">
+    <button type="button" id="btnNotifyWa">Manage numbers</button>
+    <button type="button" id="btnNotifyDismiss">Dismiss</button>
+  </div>
+</div>
+<div id="waBackdrop"><div id="waModal">
+  <h3>WhatsApp recipients</h3>
+  <p class="sub">One number per line, international format starting with <code style="background:#15181e;padding:2px 6px;border-radius:4px;">+</code>.<br/>
+  Turn on &quot;Auto-send&quot; below to message on detection; saving applies to new events immediately.</p>
+  <label for="waPhones" class="muted" style="font-size:0.86rem;display:block;margin-bottom:6px;">Phone numbers</label>
+  <textarea id="waPhones" placeholder="+886912345678\n+85291234567">%s</textarea>
+  <div class="wa-row">
+    <span class="muted" style="font-size:0.9rem;">Auto-send WhatsApp after detection</span>
+    <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;">
+      <input type="checkbox" id="waAutoToggle"%s style="width:44px;height:22px;">
+      <span id="waAutoLabel">%s</span>
+    </label>
+  </div>
+  <p id="waSaveMsg" class="muted" style="min-height:1.25em;margin:8px 0 0;font-size:0.86rem;"></p>
+  <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:14px;">
+    <button type="button" class="submit" style="background:#4b5563;margin:0;" id="btnWaCancel">Cancel</button>
+    <button type="button" class="submit" id="btnWaSave" style="margin:0;">Save</button>
+  </div>
+</div></div>
+<script type="application/json" id="cam-det-boot-json">%s</script>
+<script>
+(function(){
+var bootEl=document.getElementById('cam-det-boot-json');
+var boot={sinceId:0,pollMs:1500,waAuto:false};
+try{if(bootEl&&bootEl.textContent)boot=JSON.parse(bootEl.textContent);}catch(e){}
+var sinceId=typeof boot.sinceId==='number'?boot.sinceId:0;
+var pollMs=typeof boot.pollMs==='number'?boot.pollMs:1500;
+
+var bar=document.getElementById('detectNotifyBar');
+var txt=document.getElementById('detectNotifyText');
+var bd=document.getElementById('waBackdrop');
+function openWa(){if(bd)bd.classList.add('show');fetch('/home/camera-detection/api/settings',{credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(j){var ta=document.getElementById('waPhones');var tg=document.getElementById('waAutoToggle');var lb=document.getElementById('waAutoLabel');
+    if(j&&j.phones&&ta)ta.value=j.phones.join(String.fromCharCode(10));if(j&&typeof j.auto_send==='boolean'&&tg){tg.checked=j.auto_send;lb.textContent=j.auto_send?'On':'Off';}}).catch(function(){});}
+function closeWa(){if(bd)bd.classList.remove('show');}
+function showNotify(summary){
+  if(!txt||!bar)return;
+  txt.textContent=summary||'';bar.classList.add('show');
+}
+var ob=document.getElementById('btnOpenWaModal');if(ob)ob.addEventListener('click',function(e){e.preventDefault();openWa();});
+var bn=document.getElementById('btnNotifyWa');if(bn)bn.addEventListener('click',function(e){e.preventDefault();openWa();});
+var bnd=document.getElementById('btnNotifyDismiss');if(bnd)bnd.addEventListener('click',function(){if(bar)bar.classList.remove('show');});
+var bwc=document.getElementById('btnWaCancel');if(bwc)bwc.addEventListener('click',closeWa);
+if(bd)bd.addEventListener('click',function(e){if(e.target===bd)closeWa();});
+
+var waT=document.getElementById('waAutoToggle');
+var waL=document.getElementById('waAutoLabel');
+if(waT&&waL){waT.addEventListener('change',function(){waL.textContent=waT.checked?'On':'Off';});}
+
+var bws=document.getElementById('btnWaSave');if(bws)bws.addEventListener('click',function(){
+  var phonesRaw=(document.getElementById('waPhones')&&document.getElementById('waPhones').value)||'';
+  var wtg=document.getElementById('waAutoToggle');var auto=wtg&&wtg.checked;
+  var sm=document.getElementById('waSaveMsg');
+  fetch('/home/camera-detection/api/settings',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({phones_text:phonesRaw,auto_send:!!auto})}).then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+  .then(function(o){if(sm)sm.style.color=o.ok?'#86efac':'#fca5a5';if(sm)sm.textContent=o.ok?(o.j.saved||'Saved'):(o.j.error||'Save failed');}).catch(function(){if(sm){sm.style.color='#fca5a5';sm.textContent='Network error';}});
+});
+
+function poll(){
+  fetch('/home/camera-detection/poll-detections?since_id='+encodeURIComponent(sinceId),{credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(data){
+       if(!data||!data.rows||!data.rows.length)return;
+       sinceId=data.max_id!=null?data.max_id:sinceId;
+       var last=data.rows[data.rows.length-1];
+       var summary='Detection: '+ (last.camera_name||'') +' — '+ (last.created_at||'') +' — '+ (last.status||'');
+       showNotify(summary);
+    }).catch(function(){});
+}
+poll();
+setInterval(poll,pollMs);
+document.addEventListener('keydown',function(e){if(e.key==='Escape'&&bd&&bd.classList.contains('show'))closeWa();});
+})();
+</script>""" % (
+        html.escape(wa_phones_lines),
+        " checked" if wa_auto_send else "",
+        html.escape("On" if wa_auto_send else "Off"),
+        boot_json,
+    )
+
     form_html = """
 <div class="panel" style="margin-bottom:12px;">
-  <h3>RTSP Camera URL</h3>
+  <h3>Camera source</h3>
+  <p class="muted" style="font-size:0.88rem;margin:0 0 10px 0;line-height:1.4;">Enter an <strong>RTSP</strong> URL, or a <strong>local webcam index</strong> (<code>0</code> = first camera, <code>1</code> = second). Aliases <code>webcam</code> / <code>local</code> use index 0.</p>
   <form method="get" action="/home/camera-detection" style="display:grid;gap:10px;">
-    <input type="text" name="url" placeholder="rtsp://username:password@ip:554/Streaming/Channels/101" value="%s" style="flex:1;min-width:320px;">
+    <input type="text" name="url" placeholder="rtsp://… or 0 / 1 for local cameras" value="%s" style="flex:1;min-width:320px;">
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
       <label style="margin:0;">Confidence</label>
       <input type="number" name="conf" min="0.01" max="0.99" step="0.01" value="%s" style="width:100px;">
@@ -1108,11 +1716,19 @@ def camera_detection_page_html(
       <div class="muted" style="font-size:0.9rem;">Models:</div>
       %s
     </div>
-    <button class="submit" type="submit">Connect</button>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <button class="submit" type="submit">Connect</button>
+      <span class="muted" style="font-size:0.88rem;">Quick:</span>
+      <a class="submit" style="display:inline-block;padding:8px 14px;text-decoration:none;" href="%s">Local camera 0</a>
+      <a class="submit" style="display:inline-block;padding:8px 14px;text-decoration:none;" href="%s">Local camera 1</a>
+    </div>
   </form>
-</div>""" % (escaped_rtsp, ("%.2f" % conf_value), "".join(checks))
+</div>""" % (escaped_rtsp, ("%.2f" % conf_value), "".join(checks), local0_href, local1_href)
 
-    content = yolo_html + form_html + stream_box + table_html
+    notice_banner = ""
+    if camera_notice:
+        notice_banner = '<div class="notice" style="margin-bottom:12px;">%s</div>' % html.escape(camera_notice)
+    content = notify_block + notice_banner + yolo_html + form_html + stream_box + table_html
     return _dashboard_layout_html(username, "camera-detection", "Camera Detection", content)
 
 
@@ -1200,6 +1816,8 @@ def main() -> None:
                 return None
             return s["username"]
 
+    wa_state = {"last_msg": 0.0}
+    wa_lock = threading.Lock()
     state = {
         "conn": conn,
         "cursor": cursor,
@@ -1208,7 +1826,12 @@ def main() -> None:
         "yolo_models": yolo_models,
         "yolo_model_names": yolo_model_names,
         "yolo_status_text": yolo_status_text,
-        "rtsp_bridge": RtspBridge(state={"conn": conn, "cursor": cursor}, models_map=yolo_models),
+        "wa_times": wa_state,
+        "wa_lock": wa_lock,
+        "rtsp_bridge": RtspBridge(
+            state={"conn": conn, "cursor": cursor, "wa_times": wa_state, "wa_lock": wa_lock},
+            models_map=yolo_models,
+        ),
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -1224,6 +1847,15 @@ def main() -> None:
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_json(self, obj: dict | list, status: int = 200) -> None:
+            raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
 
         def _redirect(self, location: str, clear_cookie: bool = False) -> None:
             self.send_response(302)
@@ -1413,14 +2045,22 @@ def main() -> None:
                     selected_models = list(state["yolo_model_names"])
                 stream_error = ""
                 if rtsp_url:
-                    if not rtsp_url.lower().startswith("rtsp://"):
-                        stream_error = "Invalid RTSP URL. It must start with rtsp://"
+                    ok_source = bool(_is_local_camera_source(rtsp_url) or rtsp_url.lower().startswith("rtsp://"))
+                    if not ok_source:
+                        stream_error = "Invalid camera source: use rtsp://… or a local index (e.g. 0, 1) or webcam / local."
                     elif cv2 is None:
                         stream_error = "OpenCV is not available. Install with: pip install opencv-python"
                 state["cursor"].execute(
                     "SELECT created_at, camera_name, status, severity, COALESCE(details, '') FROM camera_detections ORDER BY created_at DESC LIMIT 300"
                 )
                 rows = state["cursor"].fetchall()
+                state["cursor"].execute("SELECT COALESCE(MAX(id), 0) FROM camera_detections")
+                poll_since_id = int(state["cursor"].fetchone()[0])
+                wa_list = load_whatsapp_phones_list(state["cursor"])
+                wa_lines = "\n".join(wa_list)
+                wa_auto = load_whatsapp_auto_send(state["cursor"])
+                stopped_ok = (qs.get("stopped") or [""])[0] == "1"
+                cam_notice = "Camera capture and fire detection stopped." if stopped_ok else ""
                 self._send_html(
                     camera_detection_page_html(
                         u,
@@ -1431,7 +2071,58 @@ def main() -> None:
                         conf_value=conf_value,
                         selected_models=selected_models,
                         available_models=state["yolo_model_names"],
+                        poll_since_id=poll_since_id,
+                        wa_phones_lines=wa_lines,
+                        wa_auto_send=wa_auto,
+                        camera_notice=cam_notice,
                     )
+                )
+                return
+
+            if parsed.path == "/home/camera-detection/api/settings":
+                u = session_user(self)
+                if not u:
+                    self.send_error(401, "Login required")
+                    return
+                phones = load_whatsapp_phones_list(state["cursor"])
+                self._send_json({"phones": phones, "auto_send": load_whatsapp_auto_send(state["cursor"])})
+                return
+
+            if parsed.path == "/home/camera-detection/poll-detections":
+                u = session_user(self)
+                if not u:
+                    self.send_error(401, "Login required")
+                    return
+                since_raw = (qs.get("since_id") or ["0"])[0]
+                try:
+                    since_id = int(since_raw)
+                except ValueError:
+                    since_id = 0
+                state["cursor"].execute(
+                    """
+                    SELECT id, created_at, camera_name, status, severity, COALESCE(details, '')
+                    FROM camera_detections WHERE id > ? ORDER BY id ASC LIMIT 40
+                    """,
+                    (since_id,),
+                )
+                rows_raw = state["cursor"].fetchall()
+                state["cursor"].execute("SELECT COALESCE(MAX(id), 0) FROM camera_detections")
+                max_id = int(state["cursor"].fetchone()[0])
+                self._send_json(
+                    {
+                        "max_id": max_id,
+                        "rows": [
+                            {
+                                "id": r[0],
+                                "created_at": r[1],
+                                "camera_name": r[2],
+                                "status": r[3],
+                                "severity": r[4],
+                                "details": (r[5] or "")[:220],
+                            }
+                            for r in rows_raw
+                        ],
+                    }
                 )
                 return
 
@@ -1444,8 +2135,9 @@ def main() -> None:
                     self.send_error(503, "OpenCV not installed")
                     return
                 rtsp_url = (qs.get("url") or [""])[0].strip()
-                if not rtsp_url.lower().startswith("rtsp://"):
-                    self.send_error(400, "url must start with rtsp://")
+                ok_source = bool(_is_local_camera_source(rtsp_url) or rtsp_url.lower().startswith("rtsp://"))
+                if not ok_source:
+                    self.send_error(400, "url must be rtsp://… or a local camera index (0, 1, …)")
                     return
                 conf_raw = (qs.get("conf") or [str(CONF_THRESHOLD)])[0].strip()
                 try:
@@ -1497,6 +2189,49 @@ def main() -> None:
 
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
+
+            if parsed.path == "/home/camera-detection/stop":
+                u = session_user(self)
+                if not u:
+                    self._redirect("/")
+                    return
+                try:
+                    state["rtsp_bridge"].stop()
+                except Exception:
+                    pass
+                self._redirect("/home/camera-detection?stopped=1")
+                return
+
+            if parsed.path == "/home/camera-detection/api/settings":
+                u = session_user(self)
+                if not u:
+                    self.send_error(401, "Login required")
+                    return
+                n = int(self.headers.get("Content-Length", 0))
+                if n <= 0 or n > 100_000:
+                    self._send_json({"error": "Invalid body"}, 400)
+                    return
+                raw = self.rfile.read(n)
+                try:
+                    data = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    self._send_json({"error": "Invalid JSON"}, 400)
+                    return
+                phones_out: list[str] = []
+                if isinstance(data.get("phones_text"), str):
+                    phones_out = parse_whatsapp_phones_blob(data["phones_text"])
+                elif isinstance(data.get("phones"), list):
+                    for x in data["phones"]:
+                        nline = _normalize_whatsapp_phone_line(str(x).strip())
+                        if nline and nline not in phones_out:
+                            phones_out.append(nline)
+                auto = bool(data.get("auto_send", False))
+                try:
+                    save_whatsapp_preferences(state["conn"], state["cursor"], phones_out, auto)
+                    self._send_json({"saved": "Saved", "phones": phones_out, "auto_send": auto})
+                except Exception:
+                    self._send_json({"error": "Failed to save settings"}, 500)
+                return
 
             if parsed.path == "/home/report-fire":
                 u = session_user(self)
@@ -1605,7 +2340,8 @@ def main() -> None:
                     try:
                         if image_path:
                             abs_path = os.path.abspath(image_path)
-                            if abs_path.startswith(os.path.abspath(_REPORT_IMAGE_DIR) + os.sep) and os.path.isfile(abs_path):
+                            log_root = os.path.abspath(_LOG_DIR) + os.sep
+                            if abs_path.startswith(log_root) and os.path.isfile(abs_path):
                                 os.remove(abs_path)
                     except Exception:
                         pass
